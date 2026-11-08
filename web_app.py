@@ -90,10 +90,8 @@ def parse_user_rules(rule_text):
 
 
 def parse_file_to_df(filepath, filename):
-    """究极防弹衣：放弃 Pandas 自动推导，直接用暴力文本解析"""
     ext = Path(filepath).suffix.lower()
 
-    # 1. 如果是真正的 Excel 文件（比如支付宝的 xlsx），尝试正常读取
     if ext in ['.xlsx', '.xls']:
         try:
             df_raw = pd.read_excel(filepath, header=None)
@@ -106,13 +104,11 @@ def parse_file_to_df(filepath, filename):
             if header_row != -1:
                 df = pd.read_excel(filepath, header=header_row)
                 df.columns = [str(c).strip() for c in df.columns]
-                # 如果成功读出了多列，直接返回
                 if len(df.columns) > 3:
                     return df
         except Exception:
-            pass  # 读失败，继续往下走，当作假 Excel 处理
+            pass
 
-    # 2. 暴力文本解析（专治微信的假 Excel 和所有 CSV）
     for encoding in ["utf-8-sig", "gbk", "gb18030", "utf-8"]:
         try:
             with open(filepath, 'r', encoding=encoding) as f:
@@ -127,14 +123,8 @@ def parse_file_to_df(filepath, filename):
 
             if header_index == -1: continue
 
-            # 找到表头行，确定分隔符（逗号或制表符）
             header_line = lines[header_index]
-            if ',' in header_line:
-                delimiter = ','
-            elif '\t' in header_line:
-                delimiter = '\t'
-            else:
-                delimiter = ','  # 默认
+            delimiter = '\t' if '\t' in header_line else ','
 
             import csv
             from io import StringIO
@@ -143,21 +133,17 @@ def parse_file_to_df(filepath, filename):
 
             valid_rows = []
             for row in reader:
-                # 过滤掉完全空白的行，以及列数极少的废行
                 if len(row) >= 3 and any(cell.strip() for cell in row):
                     valid_rows.append(row)
 
             if not valid_rows: continue
 
-            # 表头行可能因为微信多加逗号导致列数偏多，我们截断到和数据一致
             header = valid_rows[0]
             data = valid_rows[1:]
 
-            # 智能对齐列数
             max_cols = len(header)
             clean_header = header[:max_cols]
 
-            # 防止表头有重复列名（如两个"金额"）
             seen = set()
             unique_header = []
             for col in clean_header:
@@ -167,7 +153,6 @@ def parse_file_to_df(filepath, filename):
                 seen.add(col_name)
                 unique_header.append(col_name)
 
-            # 数据行同样按表头长度截断或补齐
             clean_data = []
             for row in data:
                 if len(row) < max_cols:
@@ -224,6 +209,7 @@ def process_data(filepath, filename, combo_rules, expand_dict, global_dict):
     if not amount_col: raise ValueError("找不到金额列！")
     df["金额"] = df[amount_col].apply(clean_amount)
 
+    # ================= 核心修改：兼容“不计收支” =================
     if "收/支" in df.columns:
         df["收支"] = df["收/支"].astype(str).str.strip()
     elif "收支" in df.columns:
@@ -233,6 +219,10 @@ def process_data(filepath, filename, combo_rules, expand_dict, global_dict):
             lambda x: "收入" if any(k in str(x) for k in ["退款", "收入", "转入"]) else "支出")
     else:
         df["收支"] = "支出"
+
+        # 支付宝特有的“不计收支”，我们将其处理为“不计收支”，并在后面特殊过滤
+    df.loc[df["收支"].str.contains("不计收支", na=False), "收支"] = "不计收支"
+    # ==========================================================
 
     if "交易状态" in df.columns:
         df = df[~df["交易状态"].astype(str).str.contains("失败", na=False)]
@@ -251,6 +241,15 @@ def process_data(filepath, filename, combo_rules, expand_dict, global_dict):
         desc_text = str(row.get(desc_col, "")).strip() if desc_col else ""
         combined_text = target_name + desc_text
         original_cat = row["原分类"]
+        current_shouzhi = row["收支"]
+
+        # 【核心1】：如果是“不计收支”，先判断是不是内部流转，打上特定标签
+        if current_shouzhi == "不计收支":
+            if any(k in original_cat or k in combined_text for k in ["投资", "理财", "还款", "提现", "余额宝", "转账"]):
+                categories.append("内部资金流转(不计入总额)")
+            else:
+                categories.append("不计收支(其他)")
+            continue
 
         matched = False
         for rule in combo_rules:
@@ -297,8 +296,9 @@ def process_data(filepath, filename, combo_rules, expand_dict, global_dict):
 
 
 def find_cancel_out_records(df):
-    expenses = df[df["收支"].str.contains("支出", na=False)].copy()
-    incomes = df[df["收支"].str.contains("收入", na=False)].copy()
+    # 只在“支出”和“收入”里找对冲，排除不计收支
+    expenses = df[df["收支"] == "支出"].copy()
+    incomes = df[df["收支"] == "收入"].copy()
     rows_to_drop = set()
     cancel_records = []
 
@@ -368,7 +368,7 @@ async def index():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>智能记账助手 V9.0</title>
+        <title>智能记账助手 V9.1</title>
         <style>
             * { box-sizing: border-box; }
             body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #eef2f5; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; }
@@ -410,8 +410,8 @@ async def index():
     </head>
     <body>
         <div class="container">
-            <h1>📊 智能记账助手 (V9.0)</h1>
-            <div class="subtitle">超强兼容，真假 Excel 通吃</div>
+            <h1>📊 智能记账助手 (V9.1)</h1>
+            <div class="subtitle">完美过滤内部资金流转，真假 Excel 通吃</div>
 
             <div class="grid-container">
                 <div class="card" style="flex: 0.8;">
@@ -716,6 +716,8 @@ async def analyze_files(bill_files: list[UploadFile] = File(...), rule_text: str
 
     all_df = pd.concat(processed_frames, ignore_index=True).dropna(subset=["日期", "金额"])
 
+    # 不要在这里剔除“不计收支”，因为用户可能在“手动归类的提示”里看到它
+    # 但是为了去重，可以保留
     all_df = all_df.drop_duplicates(subset=["时间", "金额", "交易对方", "订单号"])
     all_df = all_df.reset_index(drop=True)
 
@@ -735,7 +737,8 @@ async def check_vague(payload: dict = Body(...)):
         return {"vague_records": []}
 
     all_df = pd.read_pickle(pkl_path)
-    expense_df = all_df[all_df["收支"].str.contains("支出", na=False)]
+    # 只针对真正的支出寻找模糊分类，排除内部流转
+    expense_df = all_df[(all_df["收支"] == "支出") & (~all_df["消费类型"].str.contains("内部资金", na=False))]
     vague_mask = expense_df["消费类型"].isin(VAGUE_CATEGORIES)
     vague_df = expense_df[vague_mask]
 
@@ -796,8 +799,11 @@ async def generate_excel(payload: dict = Body(...)):
             rows_to_drop.add(record["expense_idx"])
             rows_to_drop.add(record["income_idx"])
 
+    # 剔除被抵消的行
     final_df = all_df.drop(index=list(rows_to_drop), errors='ignore')
-    final_df = final_df[final_df["收支"].str.contains("支出", na=False)]
+
+    # 【核心2】：最终生成表格时，剔除所有的“收入”和“不计收支”，只留“支出”
+    final_df = final_df[final_df["收支"] == "支出"]
 
     if final_df.empty:
         shutil.rmtree(temp_dir, True)
@@ -806,7 +812,11 @@ async def generate_excel(payload: dict = Body(...)):
     final_df = final_df.drop_duplicates(subset=["时间", "金额", "交易对方", "订单号"])
     final_df["月份"] = final_df["日期"].str[:7]
 
-    daily_pivot = final_df.pivot_table(index="日期", columns="消费类型", values="金额", aggfunc="sum", fill_value=0)
+    # 如果用户强行把“不计收支”手动改成了“餐饮”，它会算进“支出”里。
+    # 如果是内部流转，它的标签是“内部资金流转(不计入总额)”，我们也不把它放入 daily_pivot 统计（但保留在明细里）
+    stat_df = final_df[~final_df["消费类型"].str.contains("内部资金", na=False)]
+
+    daily_pivot = stat_df.pivot_table(index="日期", columns="消费类型", values="金额", aggfunc="sum", fill_value=0)
     daily_pivot["当日合计"] = daily_pivot.sum(axis=1)
     daily_pivot = daily_pivot.sort_index()
 
@@ -821,13 +831,15 @@ async def generate_excel(payload: dict = Body(...)):
         merged_records.append(month_total_record)
 
     merged_df = pd.DataFrame(merged_records)
-    cols = ["日期/月份"] + [c for c in merged_df.columns if c != "日期/月份"]
-    merged_df = merged_df[cols]
+    if not merged_df.empty:
+        cols = ["日期/月份"] + [c for c in merged_df.columns if c != "日期/月份"]
+        merged_df = merged_df[cols]
 
     output_path = os.path.join(temp_dir, "result.xlsx")
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        merged_df.to_excel(writer, sheet_name="每日与每月完整账本", index=False)
+        if not merged_df.empty:
+            merged_df.to_excel(writer, sheet_name="每日与每月完整账本", index=False)
         if selected_cancel_records:
             clean_records = []
             for r in selected_cancel_records:
@@ -841,6 +853,8 @@ async def generate_excel(payload: dict = Body(...)):
                 })
             df_cancel = pd.DataFrame(clean_records)
             df_cancel.to_excel(writer, sheet_name="已确认的代付对冲明细", index=False)
+
+        # 最终明细里，我们会展示所有流水（包括内部流转），方便用户审计
         final_df[["日期", "月份", "消费类型", "金额", "来源"]].to_excel(writer, sheet_name="真实支出明细", index=False)
         auto_adjust_column_width(writer)
         format_excel(writer)
